@@ -1,5 +1,24 @@
 import json
 import os
+import multiprocessing
+
+
+def receipt_queue(queue, out_queue):
+    """
+    due to ansible forking, use this thread to aggregate data from the tasks, then send back all that data to the
+    parent process when done
+    """
+    receipts = []
+    while True:
+        item = queue.get()
+        if item == 'finished':
+            break
+        receipts.append(item)
+    # send back everything
+    for receipt in receipts:
+        out_queue.put(receipt)
+    out_queue.put('finished')
+
 
 class CallbackModule(object):
     """
@@ -7,32 +26,35 @@ class CallbackModule(object):
     """
 
     def __init__(self):
-        self._receipts = {}
         self._current_task = None
+        if not os.getenv('ANSIBLE_RECEIPTS_FILE'):
+            return
+
+        self._queue = multiprocessing.Queue()
+        self._out_queue = multiprocessing.Queue()
+        self._proc = multiprocessing.Process(target=receipt_queue, args=(self._queue, self._out_queue, ))
+        self._proc.start()
+
+    def _put(self, item):
+        if not self._queue:
+            return
+        self._queue.put(item)
 
     def _register_facts(self, host, facts):
-        self._receipts[host] = {
-            'facts': facts,
-            'tasks': [],
-            'stats': {
-                'ok': 0,
-                'failed': 0,
-                'unreachable': 0,
-                'changed': 0,
-                'skipped': 0
-            }
-        }
+        self._put({
+            'type': 'facts',
+            'host': host,
+            'facts': facts
+        })
 
     def _register_task(self, host, state, res=None):
-        self._receipts[host]['tasks'].append({
-            'name': self._current_task,
+        self._put({
+            'type': 'task',
+            'task': self._current_task,
+            'host': host,
             'state': state,
             'res': res
         })
-
-        self._receipts[host]['stats'][state] += 1
-        if 'changed' in res and res['changed']:
-            self._receipts[host]['stats']['changed'] += 1
 
     def on_any(self, *args, **kwargs):
         pass
@@ -84,7 +106,8 @@ class CallbackModule(object):
     def playbook_on_task_start(self, name, is_conditional):
         self._current_task = name
 
-    def playbook_on_vars_prompt(self, varname, private=True, prompt=None, encrypt=None, confirm=False, salt_size=None, salt=None, default=None):
+    def playbook_on_vars_prompt(self, varname, private=True, prompt=None, encrypt=None, confirm=False, salt_size=None,
+                                salt=None, default=None):
         pass
 
     def playbook_on_setup(self):
@@ -100,12 +123,49 @@ class CallbackModule(object):
         pass
 
     def playbook_on_stats(self, stats):
-        receipt_file = os.getenv('ANSIBLE_RECEIPTS_FILE')
-        if not receipt_file:
+        if not self._queue:
             return
 
+        receipts = {}
+        # playbook is finished, tell that to our helper thread, then read from the output queue
+        self._queue.put('finished')
+        while True:
+            receipt = self._out_queue.get()
+            if receipt == 'finished':
+                break
+
+            if 'type' not in receipt:
+                raise RuntimeError('garbage in receipt queue')
+
+            if receipt['type'] == 'facts':
+                receipts[receipt['host']] = {
+                    'facts': receipt['facts'],
+                    'tasks': [],
+                    'stats': {
+                        'ok': 0,
+                        'changed': 0,
+                        'failed': 0,
+                        'skipped': 0,
+                        'unreachable': 0
+                    }
+                }
+            elif receipt['type'] == 'task':
+                receipts[receipt['host']]['tasks'].append({
+                    'name': receipt['task'],
+                    'state': receipt['state'],
+                    'res': receipt['res']
+                })
+
+                receipts[receipt['host']]['stats'][receipt['state']] += 1
+                if 'changed' in receipt['res'] and receipt['res']['changed']:
+                    receipts[receipt['host']]['stats']['changed'] += 1
+
+        # terminate thread
+        self._proc.join()
+
+        receipt_file = os.getenv('ANSIBLE_RECEIPTS_FILE')
         if not os.path.exists(os.path.basename(receipt_file)):
             os.makedirs(os.path.basename(receipt_file))
 
         with open(receipt_file, 'w') as fd:
-            json.dump(self._receipts, fd)
+            json.dump(receipts, fd)

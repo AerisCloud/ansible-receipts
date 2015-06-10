@@ -40,16 +40,8 @@ class CallbackModule(object):
             return
         self._queue.put(item)
 
-    def _register_facts(self, host, facts):
-        self._put({
-            'type': 'facts',
-            'host': host,
-            'facts': facts
-        })
-
     def _register_task(self, host, state, res=None):
         self._put({
-            'type': 'task',
             'task': self._current_task,
             'host': host,
             'state': state,
@@ -67,9 +59,9 @@ class CallbackModule(object):
             self._register_task(host, 'failed', res)
 
     def runner_on_ok(self, host, res):
-        if 'ansible_facts' in res:
-            self._register_facts(host, res['ansible_facts'])
-            return
+        #if 'ansible_facts' in res:
+        #    self._register_facts(host, res['ansible_facts'])
+        #    return
 
         self._register_task(host, 'ok', res)
 
@@ -134,12 +126,10 @@ class CallbackModule(object):
             if receipt == 'finished':
                 break
 
-            if 'type' not in receipt:
-                raise RuntimeError('garbage in receipt queue')
-
-            if receipt['type'] == 'facts':
-                receipts[receipt['host']] = {
-                    'facts': receipt['facts'],
+            host = receipt['host']
+            if not host in receipts:
+                receipts[host] = {
+                    'facts': {},
                     'tasks': [],
                     'stats': {
                         'ok': 0,
@@ -149,16 +139,20 @@ class CallbackModule(object):
                         'unreachable': 0
                     }
                 }
-            elif receipt['type'] == 'task':
-                receipts[receipt['host']]['tasks'].append({
+
+            if receipt['task']:
+                receipts[host]['tasks'].append({
                     'name': receipt['task'],
                     'state': receipt['state'],
                     'res': receipt['res']
                 })
 
-                receipts[receipt['host']]['stats'][receipt['state']] += 1
+                receipts[host]['stats'][receipt['state']] += 1
                 if 'changed' in receipt['res'] and receipt['res']['changed']:
-                    receipts[receipt['host']]['stats']['changed'] += 1
+                    receipts[host]['stats']['changed'] += 1
+
+            if 'ansible_facts' in receipt['res']:
+                receipts[host]['facts'].update(receipt['res']['ansible_facts'])
 
         # terminate thread
         self._proc.join()
